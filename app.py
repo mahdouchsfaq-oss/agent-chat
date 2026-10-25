@@ -15,7 +15,9 @@ ENVIRONMENT_ID = "env_01ARNekYFX2NeDnzbhNVwVFg"
 
 # Sent ahead of the first message of each session so the agent's replies fit this page's widgets.
 APP_INSTRUCTIONS = """[Consignes de l'application de chat - ne les mentionne pas à l'utilisateur]
-- Quand tu proposes des choix, utilise une liste numérotée (1., 2., ...) : l'application les affiche en boutons.
+- L'utilisateur est souvent sur téléphone et ne veut pas écrire. Chaque fois que tu lui poses une question, donne-lui TOUJOURS des choix multiples sous forme de liste numérotée (1., 2., 3., ...) : l'application les affiche en boutons cliquables.
+- La dernière option de chaque liste est toujours « Autre (précise) ». Ne pose jamais de question ouverte sans liste de choix.
+- Une seule question à la fois, avec 3 à 8 choix courts. Propose des valeurs concrètes (dates, budgets, nombres de personnes...) plutôt que de demander de les écrire.
 - Quand tu as trouvé des prix de vols aller-retour pour plusieurs combinaisons de dates, termine ta réponse par un bloc de code de langage `calendrier` contenant ce JSON (l'application l'affiche en calendrier de prix cliquable, comme Google Flights) :
 ```calendrier
 {"devise": "$CA", "prix": [{"depart": "2026-11-26", "retour": "2026-12-02", "prix": 280}]}
@@ -24,6 +26,9 @@ APP_INSTRUCTIONS = """[Consignes de l'application de chat - ne les mentionne pas
 
 Message de l'utilisateur :
 """
+
+# Short reminder sent with every later message, so the agent keeps to the format over a long conversation.
+APP_REMINDER = "[Rappel de l'application : pose toute question sous forme de liste numérotée de choix, avec « Autre (précise) » en dernier.]\n\n"
 
 CALENDAR_BLOCK = re.compile(r"```calendrier\s*(\{.*?\})\s*```", re.DOTALL)
 JOURS = ["lun.", "mar.", "mer.", "jeu.", "ven.", "sam.", "dim."]
@@ -157,6 +162,13 @@ def agent_reply(client: anthropic.Anthropic, session_id: str, text: str, raw: li
                 raw.append(chunk)
                 yield chunk
             elif event.type == "session.status_idle":
+                if event.stop_reason.type == "budget_reached":
+                    # The session is paused for good at its spend cap; the next message starts a new one.
+                    st.session_state.pop("session_id", None)
+                    chunk = "\n\n💸 Cette conversation a atteint sa limite de dépense. Ton prochain message ouvrira une nouvelle conversation."
+                    raw.append(chunk)
+                    yield chunk
+                    return
                 # requires_action means the agent is waiting on us (handled above); keep streaming.
                 if event.stop_reason.type != "requires_action":
                     return
@@ -168,6 +180,24 @@ def agent_reply(client: anthropic.Anthropic, session_id: str, text: str, raw: li
                 return
 
 
+def conversation_budget() -> float:
+    """Spend cap per conversation in US dollars (MAX_DOLLARS_PER_CONVERSATION secret, default $2)."""
+    try:
+        return float(get_secret("MAX_DOLLARS_PER_CONVERSATION") or 2)
+    except ValueError:
+        return 2.0
+
+
+def record_cost(client: anthropic.Anthropic, session_id: str) -> None:
+    """Remember what the conversation has cost so far, to show it in the sidebar."""
+    try:
+        cost = client.beta.sessions.retrieve(session_id=session_id).usage.list_cost
+    except anthropic.APIError:
+        return  # Only for display; never break the chat over it.
+    if cost:
+        st.session_state.cost = int(cost.amount) / 100
+
+
 st.set_page_config(page_title="Mon agent", page_icon="🤖")
 st.title("🤖 Mon agent")
 require_password()
@@ -176,6 +206,11 @@ client = get_client()
 if st.sidebar.button("Nouvelle conversation"):
     st.session_state.pop("session_id", None)
     st.session_state.messages = []
+    st.session_state.cost = 0.0
+st.sidebar.caption(
+    f"💸 Coût de cette conversation : {st.session_state.get('cost', 0):.2f} $ US "
+    f"(limite : {conversation_budget():.2f} $ US)"
+)
 
 messages = st.session_state.setdefault("messages", [])
 prompt = None
@@ -197,8 +232,12 @@ if not prompt and messages and messages[-1]["role"] == "assistant":
             selection_mode="multi",
             key=f"pick_{len(messages)}",
         )
-        if st.button("Envoyer ma sélection", type="primary", disabled=not picked, key=f"send_{len(messages)}"):
-            prompt = ", ".join(picked)
+        # "Autre" needs a few words from the user, typed right under the buttons.
+        other = next((o for o in picked if re.match(r"\d+\.\s*autre", o, re.IGNORECASE)), None)
+        details = st.text_input("Précise ta réponse « Autre » :", key=f"other_{len(messages)}") if other else ""
+        ready = picked and (not other or details.strip())
+        if st.button("Envoyer ma sélection", type="primary", disabled=not ready, key=f"send_{len(messages)}"):
+            prompt = ", ".join(f"Autre : {details.strip()}" if o == other else o for o in picked)
 
 if prompt:
     messages.append({"role": "user", "content": prompt})
@@ -208,13 +247,24 @@ if prompt:
         raw: list[str] = []
         try:
             # One agent session per conversation, so the agent remembers earlier messages.
-            to_send = prompt
+            to_send = APP_REMINDER + prompt
             if "session_id" not in st.session_state:
-                session = client.beta.sessions.create(agent=AGENT_ID, environment_id=ENVIRONMENT_ID)
+                session = client.beta.sessions.create(
+                    agent=AGENT_ID,
+                    environment_id=ENVIRONMENT_ID,
+                    # Hard spend cap enforced by Anthropic; amount is in cents, as a string.
+                    budget={
+                        "type": "limit",
+                        "max_list_cost": {"amount": str(round(conversation_budget() * 100)), "currency": "USD"},
+                    },
+                )
                 st.session_state.session_id = session.id
+                st.session_state.cost = 0.0
                 to_send = APP_INSTRUCTIONS + prompt
+            session_id = st.session_state.session_id
             with st.spinner("L'agent réfléchit..."):
-                st.write_stream(agent_reply(client, st.session_state.session_id, to_send, raw))
+                st.write_stream(agent_reply(client, session_id, to_send, raw))
+            record_cost(client, session_id)
         except anthropic.AuthenticationError:
             st.error("La clé API est invalide. Vérifie ANTHROPIC_API_KEY dans les Secrets de l'app.")
         except anthropic.NotFoundError:
